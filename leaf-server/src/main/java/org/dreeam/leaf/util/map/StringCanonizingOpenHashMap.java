@@ -3,10 +3,8 @@ package org.dreeam.leaf.util.map;
 import com.google.common.collect.Interner;
 import com.google.common.collect.Interners;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
-import it.unimi.dsi.fastutil.objects.ObjectIterator;
 
 import java.util.Map;
-import java.util.function.Function;
 
 public class StringCanonizingOpenHashMap<T> extends Object2ObjectOpenHashMap<String, T> {
 
@@ -42,19 +40,29 @@ public class StringCanonizingOpenHashMap<T> extends Object2ObjectOpenHashMap<Str
         }
     }
 
-    private void putWithoutInterning(String key, T value) {
+    public void putWithoutInterning(String key, T value) {
         super.put(key, value);
     }
 
-    public static <T> StringCanonizingOpenHashMap<T> deepCopy(StringCanonizingOpenHashMap<T> incomingMap, Function<T, T> deepCopier) {
-        StringCanonizingOpenHashMap<T> newMap = new StringCanonizingOpenHashMap<>(incomingMap.size(), incomingMap.f);
-        ObjectIterator<Entry<String, T>> iterator = incomingMap.object2ObjectEntrySet().fastIterator();
-
-        while (iterator.hasNext()) {
-            Map.Entry<String, T> entry = iterator.next();
-            newMap.putWithoutInterning(entry.getKey(), deepCopier.apply(entry.getValue()));
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof Map)) return false;
+        final Map<?, ?> m = (Map<?, ?>)o;
+        if (m.size() != size()) return false;
+        if (containsNullKey) {
+            if (!value[n].equals(m.get(key[n]))) {
+                return false;
+            }
         }
-
-        return newMap;
+        final Object[] key = this.key;
+        for (int pos = n; pos-- != 0;) {
+            if (!((key[pos]) == null)) {
+                if (!value[pos].equals(m.get(key[pos]))) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 }
