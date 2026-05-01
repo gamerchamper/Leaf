@@ -7,10 +7,10 @@ Original license: GPL-3.0-only
 Original project: https://github.com/embeddedt/ModernFix
 
 diff --git a/net/minecraft/nbt/CompoundTag.java b/net/minecraft/nbt/CompoundTag.java
-index c9c050966924ddd315e7829e7f3aee2afacc106b..1971fcfbc1c79ab3ebba612f1999e5a206600ebe 100644
+index c9c050966924ddd315e7829e7f3aee2afacc106b..51cf19e3492d4c4f3cd4e1eff1679fb51ac7af01 100644
 --- a/net/minecraft/nbt/CompoundTag.java
 +++ b/net/minecraft/nbt/CompoundTag.java
-@@ -54,7 +54,7 @@ public final class CompoundTag implements Tag {
+@@ -54,13 +54,13 @@ public final class CompoundTag implements Tag {
  
          private static CompoundTag loadCompound(DataInput input, NbtAccounter nbtAccounter) throws IOException {
              nbtAccounter.accountBytes(48L);
@@ -19,6 +19,22 @@ index c9c050966924ddd315e7829e7f3aee2afacc106b..1971fcfbc1c79ab3ebba612f1999e5a2
  
              byte b;
              while ((b = input.readByte()) != 0) {
+                 String string = readString(input, nbtAccounter);
+                 Tag namedTagData = CompoundTag.readNamedTagData(TagTypes.getType(b), string, input, nbtAccounter);
+-                if (map.put(string, namedTagData) == null) {
++                if (map.put(org.dreeam.leaf.util.map.StringCanonizingOpenHashMap.intern(string), namedTagData) == null) { // Leaf - Further reduce memory footprint of CompoundTag
+                     nbtAccounter.accountBytes(36L);
+                 }
+             }
+@@ -101,7 +101,7 @@ public final class CompoundTag implements Tag {
+                         type.skip(input, nbtAccounter);
+                         break;
+                     default:
+-                        String string = readString(input, nbtAccounter);
++                        String string = org.dreeam.leaf.util.map.StringCanonizingOpenHashMap.intern(readString(input, nbtAccounter)); // Leaf - Further reduce memory footprint of CompoundTag
+                         switch (visitor.visitEntry(type, string)) {
+                             case HALT:
+                                 return StreamTagVisitor.ValueResult.HALT;
 @@ -171,7 +171,7 @@ public final class CompoundTag implements Tag {
      }
  
