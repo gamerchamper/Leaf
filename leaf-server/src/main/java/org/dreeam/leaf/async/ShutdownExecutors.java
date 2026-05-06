@@ -5,6 +5,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.dreeam.leaf.async.path.AsyncPathProcessor;
 import org.dreeam.leaf.async.tracker.AsyncTracker;
+import org.dreeam.leaf.fakeentity.FakePacketEntityEngine;
 
 import java.util.concurrent.TimeUnit;
 
@@ -47,5 +48,8 @@ public class ShutdownExecutors {
             } catch (InterruptedException ignored) {
             }
         }
+
+        FakePacketEntityEngine.savePersistentStore();
+        FakePacketEntityEngine.shutdown();
     }
 }

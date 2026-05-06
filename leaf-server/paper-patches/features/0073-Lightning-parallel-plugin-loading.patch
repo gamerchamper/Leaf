@@ -1,0 +1,516 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@local>
+Date: Wed, 6 May 2026 12:00:00 +0000
+Subject: [PATCH] Lightning parallel plugin loading
+
+
+diff --git a/src/main/java/io/papermc/paper/plugin/LeafLightningPlugins.java b/src/main/java/io/papermc/paper/plugin/LeafLightningPlugins.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1c04592dffcc9cd8450cb05db0bbb6b18a7eff3
+--- /dev/null
++++ b/src/main/java/io/papermc/paper/plugin/LeafLightningPlugins.java
+@@ -0,0 +1,35 @@
++package io.papermc.paper.plugin;
++
++import io.papermc.paper.plugin.provider.PluginProvider;
++import io.papermc.paper.plugin.provider.type.PluginFileType;
++import io.papermc.paper.plugin.provider.type.spigot.SpigotPluginProvider;
++
++/**
++ * Leaf Lightning plugins run concurrent workload phases where dependency order still permits it.
++ */
++public final class LeafLightningPlugins {
++
++    private LeafLightningPlugins() {
++    }
++
++    public static boolean isLightningProvider(PluginProvider<?> provider) {
++        return provider instanceof SpigotPluginProvider spigot
++            && spigot.file().getJarEntry(PluginFileType.LIGHTNING_PLUGIN_YML) != null;
++    }
++
++    /**
++     * Global parallelism for Lightning-only batches ({@code createInstance}+registration and {@code onLoad} segments).
++     * Prefer {@code -Dleaf.lightningPluginParallelism=N}; legacy {@code -Dleaf.lightningPluginLoadParallelism=N} is honored when unset.
++     */
++    public static int parallelism() {
++        Integer configured = Integer.getInteger("leaf.lightningPluginParallelism");
++        if (configured == null) {
++            configured = Integer.getInteger("leaf.lightningPluginLoadParallelism");
++        }
++        if (configured != null) {
++            return Math.min(256, Math.max(1, configured));
++        }
++        int cpus = Runtime.getRuntime().availableProcessors();
++        return Math.min(256, Math.max(2, cpus));
++    }
++}
+diff --git a/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/LoadOrderTree.java b/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/LoadOrderTree.java
+index 28de97623fdcbbcb8ca9fd5e995448b5d67288d6..e3f9969e24c9182d5bdcfd00b7f42f3a2ba73a38 100644
+--- a/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/LoadOrderTree.java
++++ b/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/LoadOrderTree.java
+@@ -1,6 +1,8 @@
+ package io.papermc.paper.plugin.entrypoint.strategy.modern;
+ 
+ import com.google.common.collect.Lists;
++import com.google.common.graph.EndpointPair;
++import com.google.common.graph.GraphBuilder;
+ import com.google.common.graph.MutableGraph;
+ import com.mojang.logging.LogUtils;
+ import io.papermc.paper.plugin.configuration.PluginMeta;
+@@ -83,6 +85,32 @@
+         return reversedTopographicSort;
+     }
+ 
++    List<List<String>> loadLayers() {
++        MutableGraph<String> work = GraphBuilder.from(this.graph).build();
++        for (String node : this.graph.nodes()) {
++            work.addNode(node);
++        }
++        for (EndpointPair<String> pair : this.graph.edges()) {
++            work.putEdge(pair.nodeU(), pair.nodeV());
++        }
++        List<List<String>> layers = new ArrayList<>();
++        while (!work.nodes().isEmpty()) {
++            List<String> roots = work.nodes().stream()
++                .filter(n -> work.inDegree(n) == 0)
++                .sorted()
++                .toList();
++            if (roots.isEmpty()) {
++                throw new IllegalStateException("Plugin load layer peeling failed — internal graph cycle.");
++            }
++            layers.add(new ArrayList<>(roots));
++            for (String node : roots) {
++                work.removeNode(node);
++            }
++        }
++        return layers;
++    }
++
++
+     private void logCycleError(List<List<String>> cycles, Map<String, PluginProvider<?>> providerMapMirror) {
+         LOGGER.error("=================================");
+         LOGGER.error("Circular plugin loading detected:");
+diff --git a/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/ModernPluginLoadingStrategy.java b/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/ModernPluginLoadingStrategy.java
+index 9af388a8e56806ab44f8c3ef4f97086ce38ef3b4..2da59baec06d5e2e9e7e606e9b9804655991caf1 100644
+--- a/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/ModernPluginLoadingStrategy.java
++++ b/src/main/java/io/papermc/paper/plugin/entrypoint/strategy/modern/ModernPluginLoadingStrategy.java
+@@ -7,16 +7,22 @@
+ import io.papermc.paper.plugin.entrypoint.dependency.GraphDependencyContext;
+ import io.papermc.paper.plugin.entrypoint.dependency.MetaDependencyTree;
+ import io.papermc.paper.plugin.entrypoint.strategy.ProviderConfiguration;
++import io.papermc.paper.plugin.LeafLightningPlugins;
+ import io.papermc.paper.plugin.entrypoint.strategy.ProviderLoadingStrategy;
+ import io.papermc.paper.plugin.provider.PluginProvider;
+ import org.bukkit.plugin.UnknownDependencyException;
+ import org.slf4j.Logger;
+ 
+ import java.util.ArrayList;
++import java.util.Comparator;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
+ 
+ @SuppressWarnings("UnstableApiUsage")
+ public class ModernPluginLoadingStrategy<T> implements ProviderLoadingStrategy<T> {
+@@ -94,40 +100,122 @@
+             loadOrderTree.add(validated);
+         }
+ 
+-        // Reverse the topographic search to let us see which providers we can load first.
+-        List<String> reversedTopographicSort = loadOrderTree.getLoadOrder();
++        // Topological waves + concurrent Lightning construction while honoring dependency layers.
++        List<String> topoOrder = loadOrderTree.getLoadOrder();
++        Map<String, Integer> topoIndex = new HashMap<>(topoOrder.size());
++        for (int i = 0; i < topoOrder.size(); i++) {
++            topoIndex.put(topoOrder.get(i), i);
++        }
++
++        List<List<String>> layers = loadOrderTree.loadLayers();
+         List<ProviderPair<T>> loadedPlugins = new ArrayList<>();
+-        for (String providerIdentifier : reversedTopographicSort) {
+-            // It's possible that this will be null because the above dependencies for soft/load before aren't validated if they exist.
+-            // The graph could be MutableGraph<PluginProvider<T>>, but we would have to check if each dependency exists there... just
+-            // nicer to do it here TBH.
+-            PluginProviderEntry<T> retrievedProviderEntry = providerMap.get(providerIdentifier);
+-            if (retrievedProviderEntry == null || retrievedProviderEntry.provided) {
+-                // OR if this was already provided (most likely from a plugin that already "provides" that dependency)
+-                // This won't matter since the provided plugin is loaded as a dependency, meaning it should have been loaded correctly anyways
+-                continue; // Skip provider that doesn't exist....
++
++        int parallelism = LeafLightningPlugins.parallelism();
++        ExecutorService lightningExecutors = parallelism > 1 ? Executors.newWorkStealingPool(parallelism) : null;
++        try {
++            for (List<String> layer : layers) {
++                List<String> activeLayer = new ArrayList<>(layer.size());
++                for (String id : layer) {
++                    PluginProviderEntry<T> entry = providerMap.get(id);
++                    if (entry != null && !entry.provided) {
++                        activeLayer.add(id);
++                    }
++                }
++                if (activeLayer.isEmpty()) {
++                    continue;
++                }
++                activeLayer.sort(Comparator.comparingInt(topoIndex::get));
++
++                List<String> sequentialIds = new ArrayList<>();
++                List<String> lightningIds = new ArrayList<>();
++                for (String id : activeLayer) {
++                    PluginProviderEntry<T> entry = providerMap.get(id);
++                    if (entry == null || entry.provided) {
++                        continue;
++                    }
++                    if (LeafLightningPlugins.isLightningProvider(entry.provider)) {
++                        lightningIds.add(id);
++                    } else {
++                        sequentialIds.add(id);
++                    }
++                }
++
++                for (String id : sequentialIds) {
++                    this.loadProvider(providerMap, dependencyTree, id, loadedPlugins);
++                }
++
++                if (lightningIds.isEmpty()) {
++                    continue;
++                }
++                if (lightningExecutors == null || lightningIds.size() == 1) {
++                    for (String id : lightningIds) {
++                        this.loadProvider(providerMap, dependencyTree, id, loadedPlugins);
++                    }
++                } else {
++                    List<Future<?>> futures = new ArrayList<>(lightningIds.size());
++                    for (String id : lightningIds) {
++                        futures.add(lightningExecutors.submit(() -> this.loadProvider(providerMap, dependencyTree, id, loadedPlugins)));
++                    }
++                    for (Future<?> future : futures) {
++                        try {
++                            future.get();
++                        } catch (InterruptedException ex) {
++                            Thread.currentThread().interrupt();
++                            LOGGER.error("Interrupted while loading Lightning plugins", ex);
++                            break;
++                        } catch (ExecutionException ex) {
++                            LOGGER.error("Parallel Lightning plugin load failed", ex.getCause());
++                        }
++                    }
++                }
++            }
++        } finally {
++            if (lightningExecutors != null) {
++                lightningExecutors.shutdown();
++            }
++        }
++
++        loadedPlugins.sort(Comparator.comparingInt(pair -> topoIndex.getOrDefault(pair.provider().getMeta().getName(), Integer.MAX_VALUE)));
++        return loadedPlugins;
++    }
++
++
++    private void loadProvider(
++        Map<String, PluginProviderEntry<T>> providerMap,
++        MetaDependencyTree dependencyTree,
++        String providerIdentifier,
++        List<ProviderPair<T>> loadedPlugins
++    ) {
++        PluginProviderEntry<T> retrievedProviderEntry = providerMap.get(providerIdentifier);
++        if (retrievedProviderEntry == null || retrievedProviderEntry.provided) {
++            return;
++        }
++        synchronized (retrievedProviderEntry) {
++            if (retrievedProviderEntry.provided) {
++                return;
+             }
+             retrievedProviderEntry.provided = true;
+-            PluginProvider<T> retrievedProvider = retrievedProviderEntry.provider;
+-            try {
+-                this.configuration.applyContext(retrievedProvider, dependencyTree);
+-
+-                if (this.configuration.preloadProvider(retrievedProvider)) {
+-                    T instance = retrievedProvider.createInstance();
+-                    if (this.configuration.load(retrievedProvider, instance)) {
++        }
++        PluginProvider<T> retrievedProvider = retrievedProviderEntry.provider;
++        try {
++            this.configuration.applyContext(retrievedProvider, dependencyTree);
++
++            if (this.configuration.preloadProvider(retrievedProvider)) {
++                T instance = retrievedProvider.createInstance();
++                if (this.configuration.load(retrievedProvider, instance)) {
++                    synchronized (loadedPlugins) {
+                         loadedPlugins.add(new ProviderPair<>(retrievedProvider, instance));
+                     }
+                 }
+-            } catch (Throwable ex) {
+-                LOGGER.error("Could not load plugin '%s' in folder '%s'".formatted(retrievedProvider.getFileName(), retrievedProvider.getParentSource()), ex); // Paper
+             }
++        } catch (Throwable ex) {
++            LOGGER.error("Could not load plugin '%s' in folder '%s'".formatted(retrievedProvider.getFileName(), retrievedProvider.getParentSource()), ex); // Paper
+         }
+-
+-        return loadedPlugins;
+     }
+ 
+     private static class PluginProviderEntry<T> {
+ 
++
+         private final PluginProvider<T> provider;
+         private boolean provided;
+ 
+diff --git a/src/main/java/io/papermc/paper/plugin/storage/SimpleProviderStorage.java b/src/main/java/io/papermc/paper/plugin/storage/SimpleProviderStorage.java
+index 26422904751647a061397ce978bba752149003cd..34def2e45fd882013bd2f05e115cc049456ba0e4 100644
+--- a/src/main/java/io/papermc/paper/plugin/storage/SimpleProviderStorage.java
++++ b/src/main/java/io/papermc/paper/plugin/storage/SimpleProviderStorage.java
+@@ -25,7 +25,7 @@
+     }
+ 
+     @Override
+-    public void register(PluginProvider<T> provider) {
++    public synchronized void register(PluginProvider<T> provider) {
+         this.providers.add(provider);
+     }
+ 
+@@ -35,14 +35,19 @@
+         this.filterLoadingProviders(providerList);
+ 
+         try {
+-            for (ProviderLoadingStrategy.ProviderPair<T> providerPair : this.strategy.loadProviders(providerList, this.createDependencyTree())) {
+-                this.processProvided(providerPair.provider(), providerPair.provided());
+-            }
++            List<ProviderLoadingStrategy.ProviderPair<T>> pairs = this.strategy.loadProviders(providerList, this.createDependencyTree());
++            this.afterProvidersLoaded(pairs);
+         } catch (PluginGraphCycleException exception) {
+             this.handleCycle(exception);
+         }
+     }
+ 
++    protected void afterProvidersLoaded(List<ProviderLoadingStrategy.ProviderPair<T>> pairs) {
++        for (ProviderLoadingStrategy.ProviderPair<T> providerPair : pairs) {
++            this.processProvided(providerPair.provider(), providerPair.provided());
++        }
++    }
++
+     @Override
+     public MetaDependencyTree createDependencyTree() {
+         return new SimpleMetaDependencyTree(GraphBuilder.directed().build());
+diff --git a/src/main/java/io/papermc/paper/plugin/storage/ServerPluginProviderStorage.java b/src/main/java/io/papermc/paper/plugin/storage/ServerPluginProviderStorage.java
+index cb9b13522a976b82bcb71cef486f11f4172e3e99..018b0e60519b8baad1e9eafbf0fb06a23c8a79d1 100644
+--- a/src/main/java/io/papermc/paper/plugin/storage/ServerPluginProviderStorage.java
++++ b/src/main/java/io/papermc/paper/plugin/storage/ServerPluginProviderStorage.java
+@@ -8,12 +8,20 @@
+ import io.papermc.paper.plugin.provider.PluginProvider;
+ import io.papermc.paper.plugin.provider.ProviderStatus;
+ import io.papermc.paper.plugin.provider.ProviderStatusHolder;
++import io.papermc.paper.plugin.LeafLightningPlugins;
++import io.papermc.paper.plugin.entrypoint.strategy.ProviderLoadingStrategy;
+ import io.papermc.paper.plugin.provider.type.paper.PaperPluginParent;
+ import org.bukkit.plugin.Plugin;
+ import org.bukkit.plugin.java.JavaPlugin;
+ import org.slf4j.Logger;
+ 
++import java.util.ArrayList;
+ import java.util.List;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++
+ 
+ public class ServerPluginProviderStorage extends ConfiguredProviderStorage<JavaPlugin> {
+ 
+@@ -42,6 +50,59 @@
+         });
+     }
+ 
++
++    @Override
++    protected void afterProvidersLoaded(List<ProviderLoadingStrategy.ProviderPair<JavaPlugin>> pairs) {
++        int parallelism = LeafLightningPlugins.parallelism();
++        ExecutorService pool = parallelism > 1 ? Executors.newWorkStealingPool(parallelism) : null;
++        try {
++            int i = 0;
++            while (i < pairs.size()) {
++                ProviderLoadingStrategy.ProviderPair<JavaPlugin> pair = pairs.get(i);
++                if (!LeafLightningPlugins.isLightningProvider(pair.provider())) {
++                    processProvided(pair.provider(), pair.provided());
++                    i++;
++                    continue;
++                }
++                int j = i;
++                while (j < pairs.size() && LeafLightningPlugins.isLightningProvider(pairs.get(j).provider())) {
++                    j++;
++                }
++                if (pool == null || j - i <= 1) {
++                    for (int k = i; k < j; k++) {
++                        ProviderLoadingStrategy.ProviderPair<JavaPlugin> p = pairs.get(k);
++                        processProvided(p.provider(), p.provided());
++                    }
++                } else {
++                    List<Future<?>> futures = new ArrayList<>(j - i);
++                    for (int k = i; k < j; k++) {
++                        final ProviderLoadingStrategy.ProviderPair<JavaPlugin> p = pairs.get(k);
++                        futures.add(pool.submit(() -> {
++                            processProvided(p.provider(), p.provided());
++                            return null;
++                        }));
++                    }
++                    for (Future<?> future : futures) {
++                        try {
++                            future.get();
++                        } catch (InterruptedException ex) {
++                            Thread.currentThread().interrupt();
++                            LOGGER.error("Interrupted during parallel Lightning plugin onLoad", ex);
++                            break;
++                        } catch (ExecutionException ex) {
++                            LOGGER.error("Parallel Lightning plugin onLoad failed", ex.getCause());
++                        }
++                    }
++                }
++                i = j;
++            }
++        } finally {
++            if (pool != null) {
++                pool.shutdown();
++            }
++        }
++    }
++
+     @Override
+     protected void filterLoadingProviders(List<PluginProvider<JavaPlugin>> pluginProviders) {
+          /*
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java b/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
+index 00dbd17a23781468f1aae76f7eddd885a7321c16..d86187c81776dbc9aa55dd4cc1c90205cbc21e29 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/source/DirectoryProviderSource.java
+@@ -8,6 +8,7 @@
+ import java.nio.file.Path;
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.stream.IntStream;
+ import java.util.function.Consumer;
+ import org.slf4j.Logger;
+ 
+@@ -38,16 +39,28 @@
+             Files.createDirectories(context);
+         }
+ 
+-        final List<Path> files = new ArrayList<>();
+-        this.walkFiles(context, path -> {
++        final List<Path> raw = new ArrayList<>();
++        this.walkFiles(context, raw::add);
++
++        final Path[] prepared = new Path[raw.size()];
++        IntStream.range(0, raw.size()).parallel().forEach(idx -> {
++            Path path = raw.get(idx);
+             try {
+-                files.add(FILE_PROVIDER_SOURCE.prepareContext(path));
++                prepared[idx] = FILE_PROVIDER_SOURCE.prepareContext(path);
+             } catch (IllegalArgumentException ignored) {
+-                // Ignore illegal argument exceptions from jar checking
++                prepared[idx] = null;
+             } catch (final Exception e) {
+                 LOGGER.error("Error preparing plugin context: " + e.getMessage(), e);
++                prepared[idx] = null;
+             }
+         });
++
++        final List<Path> files = new ArrayList<>(prepared.length);
++        for (Path p : prepared) {
++            if (p != null) {
++                files.add(p);
++            }
++        }
+         // Paper start - Remap plugins
+         if (io.papermc.paper.plugin.PluginInitializerManager.instance().pluginRemapper != null) {
+             return io.papermc.paper.plugin.PluginInitializerManager.instance().pluginRemapper.rewritePluginDirectory(files);
+@@ -58,7 +71,7 @@
+ 
+     @Override
+     public void registerProviders(EntrypointHandler entrypointHandler, List<Path> context) {
+-        for (Path path : context) {
++        context.parallelStream().forEach(path -> {
+             try {
+                 FILE_PROVIDER_SOURCE.registerProviders(entrypointHandler, path);
+             } catch (IllegalArgumentException ignored) {
+@@ -66,7 +79,7 @@
+             } catch (Exception e) {
+                 LOGGER.error("Error loading plugin: " + e.getMessage(), e);
+             }
+-        }
++        });
+     }
+ 
+     private void walkFiles(Path context, Consumer<Path> consumer) throws IOException {
+diff --git a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
+index 4dd7c6c0d7f54f5cc5879b9c60c60c455f00c9f8..b6c999bb977f060c1dbd11f573aac29a438e5897 100644
+--- a/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
++++ b/src/main/java/io/papermc/paper/plugin/manager/PaperPluginInstanceManager.java
+@@ -90,7 +90,7 @@
+         }
+     }
+ 
+-    public void loadPlugin(Plugin provided) {
++    public synchronized void loadPlugin(Plugin provided) {
+         PluginMeta configuration = provided.getPluginMeta();
+ 
+         this.plugins.add(provided);
+diff --git a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/PaperPluginClassLoaderStorage.java b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/PaperPluginClassLoaderStorage.java
+index e6fcdeb96356ff4713627b1458ac8bbfad1866b1..9ce7ef799b1f1f38b5336220772dc22b0cbe5fb3 100644
+--- a/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/PaperPluginClassLoaderStorage.java
++++ b/src/main/java/io/papermc/paper/plugin/entrypoint/classloader/group/PaperPluginClassLoaderStorage.java
+@@ -24,19 +24,19 @@
+     }
+ 
+     @Override
+-    public PluginClassLoaderGroup registerSpigotGroup(PluginClassLoader pluginClassLoader) {
++    public synchronized PluginClassLoaderGroup registerSpigotGroup(PluginClassLoader pluginClassLoader) {
+         return this.registerGroup(pluginClassLoader, new SpigotPluginClassLoaderGroup(this.globalGroup, (library) -> {
+             return pluginClassLoader.dependencyContext.isTransitiveDependency(pluginClassLoader.getConfiguration(), library.getConfiguration());
+         }, pluginClassLoader));
+     }
+ 
+     @Override
+-    public PluginClassLoaderGroup registerOpenGroup(ConfiguredPluginClassLoader classLoader) {
++    public synchronized PluginClassLoaderGroup registerOpenGroup(ConfiguredPluginClassLoader classLoader) {
+         return this.registerGroup(classLoader, this.globalGroup);
+     }
+ 
+     @Override
+-    public PluginClassLoaderGroup registerAccessBackedGroup(ConfiguredPluginClassLoader classLoader, ClassLoaderAccess access) {
++    public synchronized PluginClassLoaderGroup registerAccessBackedGroup(ConfiguredPluginClassLoader classLoader, ClassLoaderAccess access) {
+         List<ConfiguredPluginClassLoader> allowedLoaders = new ArrayList<>();
+         for (ConfiguredPluginClassLoader configuredPluginClassLoader : this.globalGroup.getClassLoaders()) {
+             if (access.canAccess(configuredPluginClassLoader)) {
+@@ -47,7 +47,7 @@
+         return this.registerGroup(classLoader, new StaticPluginClassLoaderGroup(allowedLoaders, access, classLoader));
+     }
+ 
+-    private PluginClassLoaderGroup registerGroup(ConfiguredPluginClassLoader classLoader, PluginClassLoaderGroup group) {
++    private synchronized PluginClassLoaderGroup registerGroup(ConfiguredPluginClassLoader classLoader, PluginClassLoaderGroup group) {
+         // Now add this classloader to any groups that allows it (includes global)
+         for (PluginClassLoaderGroup loaderGroup : this.groups) {
+             if (loaderGroup.getAccess().canAccess(classLoader)) {
+@@ -61,7 +61,7 @@
+     }
+ 
+     @Override
+-    public void unregisterClassloader(ConfiguredPluginClassLoader configuredPluginClassLoader) {
++    public synchronized void unregisterClassloader(ConfiguredPluginClassLoader configuredPluginClassLoader) {
+         this.globalGroup.remove(configuredPluginClassLoader);
+         this.groups.remove(configuredPluginClassLoader.getGroup());
+         for (PluginClassLoaderGroup group : this.groups) {
+@@ -70,7 +70,7 @@
+     }
+ 
+     @Override
+-    public boolean registerUnsafePlugin(ConfiguredPluginClassLoader pluginLoader) {
++    public synchronized boolean registerUnsafePlugin(ConfiguredPluginClassLoader pluginLoader) {
+         if (this.globalGroup.getClassLoaders().contains(pluginLoader)) {
+             return false;
+         } else {

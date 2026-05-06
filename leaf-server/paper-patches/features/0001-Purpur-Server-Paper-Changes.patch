@@ -141,7 +141,15 @@ diff --git a/src/main/java/io/papermc/paper/command/PaperPluginsCommand.java b/s
 index 9c49bb7fb8c3ca4b62e73dcfca2669971defb181..727253cb847e56e8716bc6b17512c0eb515f34e3 100644
 --- a/src/main/java/io/papermc/paper/command/PaperPluginsCommand.java
 +++ b/src/main/java/io/papermc/paper/command/PaperPluginsCommand.java
-@@ -74,10 +74,10 @@ public class PaperPluginsCommand {
+@@ -14,6 +14,7 @@
+ import io.papermc.paper.plugin.provider.PluginProvider;
+ import io.papermc.paper.plugin.provider.ProviderStatus;
+ import io.papermc.paper.plugin.provider.ProviderStatusHolder;
++import io.papermc.paper.plugin.provider.type.PluginFileType;
+ import io.papermc.paper.plugin.provider.type.paper.PaperPluginParent;
+ import io.papermc.paper.plugin.provider.type.spigot.SpigotPluginProvider;
+ import java.lang.reflect.Type;
+@@ -74,10 +75,10 @@
              .build();
      }
  
@@ -154,7 +162,7 @@ index 9c49bb7fb8c3ca4b62e73dcfca2669971defb181..727253cb847e56e8716bc6b17512c0eb
          }
  
          boolean isFirst = true;
-@@ -104,15 +104,49 @@ public class PaperPluginsCommand {
+@@ -104,15 +105,49 @@
          return formattedSubLists;
      }
  
@@ -207,10 +215,11 @@ index 9c49bb7fb8c3ca4b62e73dcfca2669971defb181..727253cb847e56e8716bc6b17512c0eb
  
          builder.append(pluginName);
  
-@@ -130,6 +164,23 @@ public class PaperPluginsCommand {
+@@ -130,6 +165,24 @@
          return componentHeader.append(Component.text(":")).build();
      }
  
++
 +    // Purpur start - Improve output of plugins command
 +    private static TextComponent getAuthors(final PluginMeta pluginMeta) {
 +        TextComponent.Builder builder = Component.text();
@@ -231,11 +240,33 @@ index 9c49bb7fb8c3ca4b62e73dcfca2669971defb181..727253cb847e56e8716bc6b17512c0eb
      private static Component asPlainComponents(final String strings) {
          final net.kyori.adventure.text.TextComponent.Builder builder = Component.text();
          for (final String string : strings.split("\n")) {
-@@ -188,25 +239,25 @@ public class PaperPluginsCommand {
+@@ -174,39 +227,53 @@
+         final CommandSender sender = context.getSource().getSender();
+         final TreeMap<String, PluginProvider<JavaPlugin>> paperPlugins = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+         final TreeMap<String, PluginProvider<JavaPlugin>> spigotPlugins = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
++        final TreeMap<String, PluginProvider<JavaPlugin>> lightningPlugins = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+ 
+         for (final PluginProvider<JavaPlugin> provider : LaunchEntryPointHandler.INSTANCE.get(Entrypoint.PLUGIN).getRegisteredProviders()) {
+             final PluginMeta configuration = provider.getMeta();
+ 
+             if (provider instanceof SpigotPluginProvider) {
+-                spigotPlugins.put(configuration.getDisplayName(), provider);
++                if (provider.file().getJarEntry(PluginFileType.LIGHTNING_PLUGIN_YML) != null) {
++                    lightningPlugins.put(configuration.getDisplayName(), provider);
++                } else {
++                    spigotPlugins.put(configuration.getDisplayName(), provider);
++                }
+             } else if (provider instanceof PaperPluginParent.PaperServerPluginProvider) {
+                 paperPlugins.put(configuration.getDisplayName(), provider);
+             }
+         }
+ 
          final int sizePaperPlugins = paperPlugins.size();
++        final int sizeLightningPlugins = lightningPlugins.size();
          final int sizeSpigotPlugins = spigotPlugins.size();
-         final int sizePlugins = sizePaperPlugins + sizeSpigotPlugins;
+-        final int sizePlugins = sizePaperPlugins + sizeSpigotPlugins;
 -        final boolean hasAllPluginTypes = (sizePaperPlugins > 0 && sizeSpigotPlugins > 0);
++        final int sizePlugins = sizePaperPlugins + sizeLightningPlugins + sizeSpigotPlugins;
 +        final boolean hasAllPluginTypes = true; // Purpur - Improve output of plugins command
  
          final Component infoMessage = Component.text().append(INFO_ICON_SERVER_PLUGIN).append(Component.text("Server Plugins (%s):".formatted(sizePlugins), NamedTextColor.WHITE)).build();
@@ -245,11 +276,18 @@ index 9c49bb7fb8c3ca4b62e73dcfca2669971defb181..727253cb847e56e8716bc6b17512c0eb
 -        if (!paperPlugins.isEmpty()) {
 +        //if (!paperPlugins.isEmpty()) { // Purpur - Improve output of plugins command
              sender.sendMessage(header("Paper Plugins", 0x0288D1, sizePaperPlugins, hasAllPluginTypes));
--        }
 +        //} // Purpur - Improve output of plugins command
++
++        for (final Component component : formatProviders(paperPlugins, sender)) { // Purpur - Improve output of plugins command
++            sender.sendMessage(component);
+         }
  
 -        for (final Component component : formatProviders(paperPlugins)) {
-+        for (final Component component : formatProviders(paperPlugins, sender)) { // Purpur - Improve output of plugins command
++        //if (!lightningPlugins.isEmpty()) { // Leaf - Lightning plugins category (Purpur always-headers style)
++            sender.sendMessage(header("Lightning Plugins", 0xB56EFF, sizeLightningPlugins, hasAllPluginTypes));
++        //} // Leaf end
++
++        for (final Component component : formatProviders(lightningPlugins, sender)) {
              sender.sendMessage(component);
          }
  

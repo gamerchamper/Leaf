@@ -219,4 +219,8 @@ public class LeafGlobalConfig {
     public String pickStringRegionBased(String en, String cn) {
         return isCN ? cn : en;
     }
+
+    public void set(String path, Object value) {
+        configFile.set(path, value);
+    }
 }

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dreeam <61569423+Dreeam-qwq@users.noreply.github.com>
+Date: Tue, 5 May 2026 00:40:26 -0400
+Subject: [PATCH] Players only mode
+
+Optional gameplay-mechanisms.players-only-mode: reject every non-ServerPlayer at entity registration (spawn API and chunk load).
+
+
+diff --git a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+index c1d24cff2af534edfb9fcc45f3cf2b31eb04c6de..454a89a08c6090048c35927990c1792fd1c0c69d 100644
+--- a/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
++++ b/ca/spottedleaf/moonrise/patches/chunk_system/level/entity/EntityLookup.java
+@@ -442,6 +442,12 @@ public abstract class EntityLookup implements LevelEntityGetter<Entity> {
+             return false;
+         }
+ 
++        // Leaf start - Players only mode
++        if (org.dreeam.leaf.config.modules.gameplay.PlayersOnlyMode.enabled && !(entity instanceof net.minecraft.server.level.ServerPlayer)) {
++            return false;
++        }
++        // Leaf end - Players only mode
++
+         if (((ChunkSystemEntity)entity).moonrise$isUpdatingSectionStatus()) {
+             LOGGER.warn("Entity " + entity + " is currently prevented from being added/removed to world since it is processing section status updates", new Throwable());
+             return false;
+diff --git a/net/minecraft/server/level/ServerLevel.java b/net/minecraft/server/level/ServerLevel.java
+index de82681bc4c647479e4c32041a10f5c3af92c86d..51aec802e3796885df40378f72455a302de134a4 100644
+--- a/net/minecraft/server/level/ServerLevel.java
++++ b/net/minecraft/server/level/ServerLevel.java
+@@ -1900,6 +1900,11 @@ public class ServerLevel extends Level implements ServerEntityGetter, WorldGenLe
+             org.spigotmc.AsyncCatcher.catchOp("entity add"); // Spigot
+         }
+         // Leaf end - SparklyPaper - parallel world ticking
++        // Leaf start - Players only mode (reject before Bukkit spawn events)
++        if (org.dreeam.leaf.config.modules.gameplay.PlayersOnlyMode.enabled && !(entity instanceof ServerPlayer)) {
++            if (org.dreeam.leaf.fakeentity.FakePacketPlayersOnlyHooks.maybeSpawnFakeEggMob(this, entity, spawnReason)) {
++                return false;
++            }
++            return false;
++        }
++        // Leaf end - Players only mode
+         entity.generation = false; // Paper - Don't fire sync event during generation; Reset flag if it was added during a ServerLevel generation process
+         // Paper start - extra debug info
+         if (entity.valid) {

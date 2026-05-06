@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Leaf <leaf@leafmc.one>
+Date: Wed, 6 May 2026 00:00:00 +0000
+Subject: [PATCH] Lightning Plugins category and lightning-yml support
+
+
+diff --git a/src/main/java/io/papermc/paper/plugin/PluginInitializerManager.java b/src/main/java/io/papermc/paper/plugin/PluginInitializerManager.java
+index 3200aef1b..b927e774f 100644
+--- a/src/main/java/io/papermc/paper/plugin/PluginInitializerManager.java
++++ b/src/main/java/io/papermc/paper/plugin/PluginInitializerManager.java
+@@ -5,6 +5,7 @@ import io.papermc.paper.configuration.PaperConfigurations;
+ import io.papermc.paper.plugin.entrypoint.Entrypoint;
+ import io.papermc.paper.plugin.entrypoint.LaunchEntryPointHandler;
+ import io.papermc.paper.plugin.provider.PluginProvider;
++import io.papermc.paper.plugin.provider.type.PluginFileType;
+ import io.papermc.paper.plugin.provider.type.paper.PaperPluginParent;
+ import io.papermc.paper.plugin.provider.type.spigot.SpigotPluginProvider;
+ import io.papermc.paper.pluginremap.PluginRemapper;
+@@ -123,16 +124,21 @@ public class PluginInitializerManager {
+ 
+         final Set<String> paperPluginNames = new TreeSet<>();
+         final Set<String> legacyPluginNames = new TreeSet<>();
++        final Set<String> lightningPluginNames = new TreeSet<>();
+         LaunchEntryPointHandler.INSTANCE.getStorage().forEach((entrypoint, providerStorage) -> {
+             providerStorage.getRegisteredProviders().forEach(provider -> {
+                 if (provider instanceof final SpigotPluginProvider legacy) {
+-                    legacyPluginNames.add(String.format("%s (%s)", legacy.getMeta().getName(), legacy.getMeta().getVersion()));
++                    if (legacy.file().getJarEntry(PluginFileType.LIGHTNING_PLUGIN_YML) != null) {
++                        lightningPluginNames.add(String.format("%s (%s)", legacy.getMeta().getName(), legacy.getMeta().getVersion()));
++                    } else {
++                        legacyPluginNames.add(String.format("%s (%s)", legacy.getMeta().getName(), legacy.getMeta().getVersion()));
++                    }
+                 } else if (provider instanceof final PaperPluginParent.PaperServerPluginProvider paper) {
+                     paperPluginNames.add(String.format("%s (%s)", provider.getMeta().getName(), provider.getMeta().getVersion()));
+                 }
+             });
+         });
+-        final int total = paperPluginNames.size() + legacyPluginNames.size();
++        final int total = paperPluginNames.size() + legacyPluginNames.size() + lightningPluginNames.size();
+         LOGGER.info("Initialized {} plugin{}", total, total == 1 ? "" : "s");
+         if (!paperPluginNames.isEmpty()) {
+             if (LOGGER.isDebugEnabled()) {
+@@ -148,6 +154,13 @@ public class PluginInitializerManager {
+                 LOGGER.info("Bukkit plugins ({}):\n - {}", legacyPluginNames.size(), String.join(", ", legacyPluginNames));
+             }
+         }
++        if (!lightningPluginNames.isEmpty()) {
++            if (LOGGER.isDebugEnabled()) {
++                LOGGER.info("Lightning plugins ({}):\n - {}", lightningPluginNames.size(), String.join("\n - ", lightningPluginNames));
++            } else {
++                LOGGER.info("Lightning plugins ({}):\n - {}", lightningPluginNames.size(), String.join(", ", lightningPluginNames));
++            }
++        }
+     }
+ 
+     // This will be the end of me...
+diff --git a/src/main/java/io/papermc/paper/plugin/provider/type/PluginFileType.java b/src/main/java/io/papermc/paper/plugin/provider/type/PluginFileType.java
+index e5a5fcacc..19489f279 100644
+--- a/src/main/java/io/papermc/paper/plugin/provider/type/PluginFileType.java
++++ b/src/main/java/io/papermc/paper/plugin/provider/type/PluginFileType.java
+@@ -23,6 +23,7 @@ import java.util.jar.JarFile;
+ public abstract class PluginFileType<T, C extends PluginMeta> {
+ 
+     public static final String PAPER_PLUGIN_YML = "paper-plugin.yml";
++    public static final String LIGHTNING_PLUGIN_YML = "lightning.yml";
+     private static final List<String> CONFIG_TYPES = new ArrayList<>();
+ 
+     public static final PluginFileType<PaperPluginParent, PaperPluginMeta> PAPER = new PluginFileType<>(PAPER_PLUGIN_YML, PaperPluginParent.FACTORY) {
+@@ -43,8 +44,14 @@ public abstract class PluginFileType<T, C extends PluginMeta> {
+             entrypointHandler.register(Entrypoint.PLUGIN, provider);
+         }
+     };
++    public static final PluginFileType<SpigotPluginProvider, PluginDescriptionFile> LIGHTNING = new PluginFileType<>(LIGHTNING_PLUGIN_YML, SpigotPluginProvider.FACTORY) {
++        @Override
++        protected void register(EntrypointHandler entrypointHandler, SpigotPluginProvider provider) {
++            entrypointHandler.register(Entrypoint.PLUGIN, provider);
++        }
++    };
+ 
+-    private static final List<PluginFileType<?, ?>> VALUES = List.of(PAPER, SPIGOT);
++    private static final List<PluginFileType<?, ?>> VALUES = List.of(PAPER, LIGHTNING, SPIGOT);
+ 
+     private final String config;
+     private final PluginTypeFactory<T, C> factory;
